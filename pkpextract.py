@@ -42,6 +42,10 @@ StartFinder = Callable[[bytes], int]
 EndFinder = Callable[[bytes, int], int]
 
 
+class WeirdFileError(RuntimeError):
+    pass
+
+
 class Status(IntEnum):
     pythonFirst = auto()
     pdfFirst = auto()
@@ -49,19 +53,6 @@ class Status(IntEnum):
 
 
 # The pdf part starts with %PDF- and ends with the second %%EOF.
-_pdfStartRE = re.compile(b"%PDF-")
-
-
-def pdfPartStart(buf: bytes) -> int:
-    """Match the start of a pdf part.
-    return -1 if not found."""
-
-    mo = _pdfStartRE.search(buf)
-    if mo is None:
-        return -1
-    return mo.start()
-
-
 _pdfEndRE = re.compile(b"%%EOF")
 
 
@@ -85,27 +76,25 @@ def pdfPartEnd(buf: bytes, *args) -> int:
     return _pdfPartMaybeEnd(buf, halfEnd)
 
 
-# The python part starts with a 'from xxx import', 'import yyy', or a docstring
+# The python part starts with a 'from xxx import', 'import yyy'
 # and ends at a binary 1.
-_pythonStartRE = re.compile(b'from |import |"""')
-# _pythonStartRE = re.compile(b'from |import |"""')
+_pythonStartRE = re.compile(rb'(from (\w|\.)+ import)|(import (\w|\.)+)', re.ASCII)
 
 
 def pythonPartStart(buf: bytes) -> int:
     """Match the start of a python part.
     return -1 if not found."""
+    BACKWARD_LOOKUP_LEN = 25
+    importPos = buf.find(b'import ')
+    if importPos == -1:
+        return -1
+    if importPos < BACKWARD_LOOKUP_LEN:
+        raise WeirdFileError()
 
-    mo = _pythonStartRE.search(buf)
+    mo = _pythonStartRE.search(buf, importPos - BACKWARD_LOOKUP_LEN)
     if mo is None:
         return -1
     return mo.start()
-
-
-def pythonPartEnd(buf: bytes, *args) -> int:
-    """Match the end of a python part.
-    return -1 if not found."""
-
-    return buf.find(b"\x01", *args)
 
 
 def find_range(buf: bytes, find_start: StartFinder, find_end: EndFinder) -> IntPair:
@@ -147,13 +136,13 @@ class SplittingFinder:
         """Return size of the span, span and a triplet of buffers
         in which the span splits buf."""
 
-        span: IntPair = find_range(buf, self.find_start, self.find_end)
+        span = find_range(buf, self.find_start, self.find_end)
         return rangeSize(span), splitBuf(buf, span)
 
 
 # function objects to find the span and corresponding subdivisions of a buffer
-pdfFinder = SplittingFinder(pdfPartStart, pdfPartEnd)
-pythonFinder = SplittingFinder(pythonPartStart, pythonPartEnd)
+pdfFinder = SplittingFinder(lambda x: x.find(b"%PDF-"), pdfPartEnd)
+pythonFinder = SplittingFinder(pythonPartStart, lambda x, start: x.find(b"\x01", start))
 
 
 def rangeSize(x: IntPair) -> int:
@@ -276,27 +265,34 @@ class PkpTools:
         pdfSize, pdfSlices = pdfFinder(buf)
         if self.options.write_pdf:
             self.writeToFile(fileName, ".pdf", pdfSlices.body)
-        pythonSize, pythonSlices = pythonFinder(pdfSlices.head)
-        if pythonSize > 0:  # python in the head
-            status = Status.pythonFirst
-            # --- pdf.head ---
-            # head, python, body, pdf, tail = pythonSlices + pdfSlices[1:]
-        else:  # python not in the head
-            status = Status.pdfFirst
-            pythonSize, pythonSlices = pythonFinder(pdfSlices.tail)
-            #          ---- pdf.tail ----
-            # head, pdf, body, python, tail = pdfSlices[:2] + pythonSlices
-        if self.options.write_python or self.options.check_python:
-            error = pythonPartIsbroken(pythonSlices.body, f"{fileName}.py")
-            if error:
-                self.rejected.append(error)
-                status = Status.ERROR
-                if not self.options.quiet:
-                    print(error)
-                self.writeToFile(fileName, BROKEN_PYTHON_FILE_EXT, pythonSlices.body)
-            else:
-                if self.options.write_python:
-                    self.writeToFile(fileName, ".py", pythonSlices.body)
+        try:
+            pythonSize, pythonSlices = pythonFinder(pdfSlices.head)
+            if pythonSize > 0:  # python in the head
+                status = Status.pythonFirst
+                # --- pdf.head ---
+                head, python, body, pdf, tail = pythonSlices + pdfSlices[1:]
+            else:  # python not in the head
+                status = Status.pdfFirst
+                pythonSize, pythonSlices = pythonFinder(pdfSlices.tail)
+                #          ---- pdf.tail ----
+                head, pdf, body, python, tail = pdfSlices[:2] + pythonSlices
+            self.writeToFile(fileName, ".head", head)
+            if self.options.write_python or self.options.check_python:
+                error = pythonPartIsbroken(pythonSlices.body, f"{fileName}.py")
+                if error:
+                    self.rejected.append(error)
+                    status = Status.ERROR
+                    if not self.options.quiet:
+                        print(error)
+                    self.writeToFile(fileName, BROKEN_PYTHON_FILE_EXT, pythonSlices.body)
+                else:
+                    if self.options.write_python:
+                        self.writeToFile(fileName, ".py", pythonSlices.body)
+        except WeirdFileError:
+            status = Status.ERROR
+            error = f'{fileName} has no recognizable python part.'
+            if not self.options.quiet:
+                print(error)
         return status, pdfSize, pythonSize
 
     def writeStats(
